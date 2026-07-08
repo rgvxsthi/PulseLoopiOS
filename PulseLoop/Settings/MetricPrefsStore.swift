@@ -72,6 +72,11 @@ struct MetricPrefs: Codable, Equatable {
     /// Today-scope hidden metrics, independent of the Vitals scope.
     var todayHiddenMetrics: Set<String> = []
     var todayResolution: GraphResolution = .full
+    /// User-chosen card order per scope, stored as `MetricKey.rawValue`s. Empty means
+    /// "use the screen's default order". Keys not present here fall back to their
+    /// default position, so a newly supported metric appears without any migration.
+    var vitalsOrder: [String] = []
+    var todayOrder: [String] = []
 
     static let `default` = MetricPrefs()
 
@@ -85,6 +90,8 @@ struct MetricPrefs: Codable, Equatable {
         resolution = try c.decodeIfPresent(GraphResolution.self, forKey: .resolution) ?? d.resolution
         todayHiddenMetrics = try c.decodeIfPresent(Set<String>.self, forKey: .todayHiddenMetrics) ?? d.todayHiddenMetrics
         todayResolution = try c.decodeIfPresent(GraphResolution.self, forKey: .todayResolution) ?? d.todayResolution
+        vitalsOrder = try c.decodeIfPresent([String].self, forKey: .vitalsOrder) ?? d.vitalsOrder
+        todayOrder = try c.decodeIfPresent([String].self, forKey: .todayOrder) ?? d.todayOrder
     }
 }
 
@@ -145,6 +152,30 @@ final class MetricPrefsStore {
         case .vitals: settings.resolution = resolution
         case .today: settings.todayResolution = resolution
         }
+    }
+
+    // MARK: - Card order
+
+    /// The saved card order (`MetricKey.rawValue`s) for a scope; empty until the user reorders.
+    func order(for scope: MetricScope) -> [String] {
+        scope == .today ? settings.todayOrder : settings.vitalsOrder
+    }
+
+    func setOrder(_ order: [String], for scope: MetricScope) {
+        switch scope {
+        case .today: settings.todayOrder = order
+        case .vitals: settings.vitalsOrder = order
+        }
+    }
+
+    /// Resolves the display order for a set of currently-visible card ids: takes the saved
+    /// order (filtered to what's visible), then appends any visible-but-unordered ids in
+    /// their `defaultOrder` position. New/never-reordered metrics thus slot in sensibly.
+    func resolvedOrder(visible: Set<String>, defaultOrder: [String], scope: MetricScope) -> [String] {
+        let saved = order(for: scope).filter { visible.contains($0) }
+        let savedSet = Set(saved)
+        let missing = defaultOrder.filter { visible.contains($0) && !savedSet.contains($0) }
+        return saved + missing
     }
 
     private func persist() {

@@ -15,6 +15,15 @@ struct VitalsView: View {
     /// Owns the prepared vitals state. Created lazily in `.task` (never in `body`) so a `body`
     /// re-render never triggers DB work — it just reads the already-prepared store.
     @State private var store: VitalsStore?
+    // Card reorder ("edit mode"): long-press a card to enter, drag to reorder, Done to exit.
+    @State private var editing = false
+    @State private var dragging: MetricKey?
+    @State private var prefs = MetricPrefsStore.shared
+
+    /// Canonical Vitals card order (used until the user reorders). Card id = `MetricKey`.
+    private static let defaultOrder: [MetricKey] = [
+        .heartRate, .spo2, .bloodPressureSystolic, .hrv, .stress, .fatigue, .bloodSugar, .temperature
+    ]
 
     private var profile: UserProfile? { profiles.first }
 
@@ -34,6 +43,7 @@ struct VitalsView: View {
         .background(PulseColors.background)
         .refreshable { await coordinator.pullToRefresh() }
         .pulseScrollEdges()
+        .overlay(alignment: .top) { if editing { editDoneBar } }
         .task { ensureStore(); if isActive { store?.updateProfile(profile) } }
         .onChange(of: dataChange.token) { _, _ in if isActive { store?.refreshIfNeeded() } }
         .onChange(of: isActive) { _, active in if active { store?.updateProfile(profile) } }
@@ -41,6 +51,30 @@ struct VitalsView: View {
         .sheet(item: Binding(get: { measuring.map(VitalsMeasuringItem.init) }, set: { measuring = $0?.kind })) { item in
             MeasurementSheet(kind: item.kind)
         })
+    }
+
+    /// Floating "Done" pill shown while reordering; also reminds the user to drag.
+    private var editDoneBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.up.arrow.down")
+                .font(PulseFont.caption.weight(.semibold))
+            Text("Drag to reorder")
+                .font(PulseFont.subheadline.weight(.semibold))
+            Spacer(minLength: 12)
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { editing = false }
+            } label: {
+                Text("Done").font(PulseFont.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.plain)
+        }
+        .foregroundStyle(PulseColors.textPrimary)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .pulseGlass(Capsule(), interactive: true)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .transition(.move(edge: .top).combined(with: .opacity))
     }
 
     // MARK: - Measure row
@@ -67,31 +101,66 @@ struct VitalsView: View {
 
     // MARK: - Grid
 
-    /// Single full-width column. Each card uses the full app width so values and charts stay legible.
+    /// Single full-width column, rendered in the user's saved order. Each card uses the full
+    /// app width so values and charts stay legible. Long-press any card → reorder mode.
     @ViewBuilder
     private func grid(_ store: VitalsStore) -> some View {
         let physiology = UserPhysiologyProfile(profile)
+        let keys = orderedKeys(store)
 
         VStack(spacing: 14) {
-            chartCard(store, .heartRate, physiology)
-            chartCard(store, .spo2, physiology, showPoints: true)
-            bpCard(store, physiology)
-            chartCard(store, .hrv, physiology)
-
-            if let stress = card(store, .stress) {
-                VitalGaugeCard(model: stress) { open(.stress) }
-            }
-            if let fatigue = card(store, .fatigue) {
-                VitalGaugeCard(model: fatigue) { open(.fatigue) }
-            }
-            if let glucose = card(store, .glucose) {
-                VitalGlucoseCard(model: glucose) { open(.glucose) }
-            }
-            // Skin temperature (Colmi).
-            if store.visibleMetrics.contains(.temperature) {
-                chartCard(store, .temperature, physiology)
+            ReorderableForEach(items: keys, isEditing: editing, dragging: $dragging,
+                               move: { from, to in move(keys, from, to) }) { key in
+                cardFor(key, store, physiology)
+                    // simultaneousGesture so the long-press fires even though each card is a Button
+                    // (a plain .onLongPressGesture is swallowed by the button's own tap gesture).
+                    .simultaneousGesture(
+                        LongPressGesture(minimumDuration: 0.45).onEnded { _ in enterEdit() }
+                    )
             }
         }
+    }
+
+    /// Visible Vitals cards in the saved order (falling back to `defaultOrder`).
+    private func orderedKeys(_ store: VitalsStore) -> [MetricKey] {
+        let visible = store.visibleMetrics.intersection(Set(Self.defaultOrder))
+        let raws = prefs.resolvedOrder(
+            visible: Set(visible.map(\.rawValue)),
+            defaultOrder: Self.defaultOrder.map(\.rawValue),
+            scope: .vitals
+        )
+        return raws.compactMap { MetricKey(rawValue: $0) }
+    }
+
+    @ViewBuilder
+    private func cardFor(_ key: MetricKey, _ store: VitalsStore, _ physiology: UserPhysiologyProfile) -> some View {
+        switch key {
+        case .heartRate: chartCard(store, .heartRate, physiology)
+        case .spo2: chartCard(store, .spo2, physiology, showPoints: true)
+        case .bloodPressureSystolic: bpCard(store, physiology)
+        case .hrv: chartCard(store, .hrv, physiology)
+        case .stress:
+            if let m = card(store, .stress) { VitalGaugeCard(model: m) { open(.stress) } }
+        case .fatigue:
+            if let m = card(store, .fatigue) { VitalGaugeCard(model: m) { open(.fatigue) } }
+        case .bloodSugar:
+            if let g = card(store, .glucose) { VitalGlucoseCard(model: g) { open(.glucose) } }
+        case .temperature: chartCard(store, .temperature, physiology)
+        default: EmptyView()
+        }
+    }
+
+    private func move(_ keys: [MetricKey], _ from: Int, _ to: Int) {
+        var k = keys
+        let item = k.remove(at: from)
+        k.insert(item, at: min(to, k.count))
+        prefs.setOrder(k.map(\.rawValue), for: .vitals)
+    }
+
+    private func enterEdit() {
+        guard !editing else { return }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        withAnimation(.easeInOut(duration: 0.2)) { editing = true }
     }
 
     // MARK: - Card builders

@@ -17,6 +17,16 @@ struct TodayView: View {
     /// Owns the prepared dashboard state. Created lazily in `.task` (never in `body`) so a `body`
     /// re-render never triggers DB work — it just reads the already-prepared store.
     @State private var store: TodayStore?
+    // Tile reorder ("edit mode"): long-press a tile to enter, drag to reorder, Done to exit.
+    @State private var editing = false
+    @State private var dragging: MetricKey?
+    @State private var prefs = MetricPrefsStore.shared
+
+    /// Canonical Today tile order (used until the user reorders). Tile id = `MetricKey`.
+    private static let defaultOrder: [MetricKey] = [
+        .steps, .sleep, .heartRate, .spo2, .hrv, .temperature,
+        .stress, .fatigue, .bloodSugar, .bloodPressureSystolic
+    ]
 
     private var summaryService: CoachSummaryService { CoachSummaryService(modelContext: modelContext) }
     private var coachEnabled: Bool { coachStore.settings.coachMasterEnabled }
@@ -79,6 +89,7 @@ struct TodayView: View {
         .background(PulseColors.background)
         .refreshable { await coordinator.pullToRefresh() }
         .pulseScrollEdges()
+        .overlay(alignment: .top) { if editing { editDoneBar } }
         .task {
             ensureStore()
             if isActive { store?.updateProfile(profile) }
@@ -95,37 +106,91 @@ struct TodayView: View {
 
     // MARK: - Tile grid
 
-    /// The half-width tiles, gated by the Today-scope visibility set prepared in the store. Each metric
-    /// uses its own visual language (activity loop, sleep bar, zone chart, gauge, dual BP gauge).
+    /// The half-width tiles, in the user's saved order, gated by the Today-scope visibility set.
+    /// Each metric uses its own visual language. Long-press any tile → reorder mode.
     @ViewBuilder
     private func tiles(_ store: TodayStore) -> some View {
         let physiology = UserPhysiologyProfile(profile)
-        let visible = store.visibleMetrics
+        let keys = orderedKeys(store)
 
-        // Activity: the single combined loop, gated by the Today "Activity" toggle (`.steps` key).
-        if visible.contains(.steps) {
+        ReorderableForEach(items: keys, isEditing: editing, dragging: $dragging,
+                           move: { from, to in move(keys, from, to) }) { key in
+            cardFor(key, store, physiology)
+                // simultaneousGesture so the long-press fires even though each tile is a Button
+                // (a plain .onLongPressGesture is swallowed by the button's own tap gesture).
+                .simultaneousGesture(
+                    LongPressGesture(minimumDuration: 0.45).onEnded { _ in enterEdit() }
+                )
+        }
+    }
+
+    /// Visible Today tiles in the saved order (falling back to `defaultOrder`).
+    private func orderedKeys(_ store: TodayStore) -> [MetricKey] {
+        let visible = store.visibleMetrics.intersection(Set(Self.defaultOrder))
+        let raws = prefs.resolvedOrder(
+            visible: Set(visible.map(\.rawValue)),
+            defaultOrder: Self.defaultOrder.map(\.rawValue),
+            scope: .today
+        )
+        return raws.compactMap { MetricKey(rawValue: $0) }
+    }
+
+    @ViewBuilder
+    private func cardFor(_ key: MetricKey, _ store: TodayStore, _ physiology: UserPhysiologyProfile) -> some View {
+        switch key {
+        case .steps:
             ActivityTileView(
                 summary: store.summary, units: units,
                 caloriesAvailable: MetricsService.isVisible(.calories, context: modelContext, scope: .today),
                 onTap: { selectedTab = .activity }
             )
-        }
-
-        // Sleep: duration + stage distribution bar + score.
-        if visible.contains(.sleep) {
+        case .sleep:
             SleepTileView(sleep: store.summary.sleep) { selectedTab = .sleep }
+        case .heartRate: chartTile(store, .heartRate, physiology)
+        case .spo2: chartTile(store, .spo2, physiology, showPoints: true)
+        case .hrv: chartTile(store, .hrv, physiology)
+        case .temperature: chartTile(store, .temperature, physiology)
+        case .stress: gaugeTile(store, .stress)
+        case .fatigue: gaugeTile(store, .fatigue)
+        case .bloodSugar: gaugeTile(store, .glucose)
+        case .bloodPressureSystolic: bpTile(store, physiology)
+        default: EmptyView()
         }
+    }
 
-        if visible.contains(.heartRate) { chartTile(store, .heartRate, physiology) }
-        if visible.contains(.spo2) { chartTile(store, .spo2, physiology, showPoints: true) }
-        if visible.contains(.hrv) { chartTile(store, .hrv, physiology) }
-        if visible.contains(.temperature) { chartTile(store, .temperature, physiology) }
+    private func move(_ keys: [MetricKey], _ from: Int, _ to: Int) {
+        var k = keys
+        let item = k.remove(at: from)
+        k.insert(item, at: min(to, k.count))
+        prefs.setOrder(k.map(\.rawValue), for: .today)
+    }
 
-        if visible.contains(.stress) { gaugeTile(store, .stress) }
-        if visible.contains(.fatigue) { gaugeTile(store, .fatigue) }
-        if visible.contains(.bloodSugar) { gaugeTile(store, .glucose) }
+    private func enterEdit() {
+        guard !editing else { return }
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        withAnimation(.easeInOut(duration: 0.2)) { editing = true }
+    }
 
-        if visible.contains(.bloodPressureSystolic) { bpTile(store, physiology) }
+    /// Floating "Done" pill shown while reordering.
+    private var editDoneBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "arrow.up.arrow.down").font(PulseFont.caption.weight(.semibold))
+            Text("Drag to reorder").font(PulseFont.subheadline.weight(.semibold))
+            Spacer(minLength: 12)
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) { editing = false }
+            } label: {
+                Text("Done").font(PulseFont.subheadline.weight(.semibold))
+            }
+            .buttonStyle(.plain)
+        }
+        .foregroundStyle(PulseColors.textPrimary)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .pulseGlass(Capsule(), interactive: true)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .transition(.move(edge: .top).combined(with: .opacity))
     }
 
     @ViewBuilder
